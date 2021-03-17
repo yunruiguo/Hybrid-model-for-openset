@@ -85,7 +85,7 @@ parser.add_argument('--scale-dim', type=eval, choices=[True, False], default=Fal
 parser.add_argument('--rcrop-pad-mode', type=str, choices=['constant', 'reflect'], default='reflect')
 parser.add_argument('--padding-dist', type=str, choices=['uniform', 'gaussian'], default='uniform')
 
-parser.add_argument('--resume', type=str, default=None, help='./experiment1/models/most_recent.pth')
+parser.add_argument('--resume', type=str, default='./experiment3/models/most_recent.pth')
 parser.add_argument('--begin-epoch', type=int, default=0)
 
 parser.add_argument('--print-freq', help='Print progress every so iterations', type=int, default=20)
@@ -243,7 +243,7 @@ train_dataset = CIFARDataset(train_obj, meta_dict, class_to_idx, train_trans)
 test_dataset = CIFARDataset(test_obj, meta_dict, class_to_idx, test_trans)
 open_test_dataset = CIFARDataset(open_test_obj, open_meta_dict, open_class_to_idx, test_trans)
 train_loader = DataLoader(train_dataset, batch_size=args.batchsize, shuffle=True, num_workers=4)
-test_loader = DataLoader(test_dataset, batch_size=args.val_batchsize, shuffle=True, num_workers=4)
+test_loader = DataLoader(test_dataset, batch_size=args.val_batchsize, shuffle=False, num_workers=4)
 open_test_loader = DataLoader(open_test_dataset, batch_size=args.val_batchsize, shuffle=False, num_workers=4)
 
 
@@ -410,12 +410,9 @@ ce_meter = utils.RunningAverageMeter(0.97)
 
 def train(epoch, model):
     model.train()
-
+    end = time.time()
     total = 0
     correct = 0
-
-    end = time.time()
-
     for i, (x, y) in enumerate(train_loader):
 
         global_itr = epoch * len(train_loader) + i
@@ -541,10 +538,12 @@ def validate(epoch, model, ema=None):
     logger.info(s)
     return bpd_meter.avg
 
-def open_test(model):
+def open_test(epoch, model, ema=None):
     """
     Evaluates the cross entropy between p_data and p_model.
     """
+    if ema is not None:
+        ema.swap()
     update_lipschitz(model)
     model.eval()
     correct = 0
@@ -558,16 +557,19 @@ def open_test(model):
 
             y = y.to(device)
             probs, predicted = logits.max(1)
-            known_logpx.extend(logpx.tolist())
+            known_logpx.extend(probs.tolist())
             total += y.size(0)
             correct += predicted.eq(y).sum().item()
+        acc = correct / total
         for i, (x, y) in enumerate(tqdm(open_test_loader)):
             x = x.to(device)
             bpd, logits, _, _, logpx = compute_loss(x, model)
 
             y = y.to(device)
             probs, predicted = logits.max(1)
-            unknown_logpx.extend(logpx.tolist())
+            unknown_logpx.extend(probs.tolist())
+    if ema is not None:
+        ema.swap()
     labels = [1]*len(known_logpx) + [0]*len(unknown_logpx)
     preds = known_logpx + unknown_logpx
     auc = roc_auc_score(labels, preds)
@@ -618,8 +620,8 @@ def main():
     ords = []
 
     if args.resume:
-        validate(args.begin_epoch - 1, model, ema)
-        open_test(model)
+        #validate(args.begin_epoch - 1, model, ema)
+        open_test(args.begin_epoch - 1, model, ema)
     for epoch in range(args.begin_epoch, args.nepochs):
 
         logger.info('Current LR {}'.format(optimizer.param_groups[0]['lr']))
