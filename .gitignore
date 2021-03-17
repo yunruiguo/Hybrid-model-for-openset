@@ -2,3 +2,6 @@
 *__pycache__*
 data/*
 pretrained_models
+experiment1/
+experiment2/
+experiment3/

@@ -71,7 +71,8 @@ class LogitTransform(nn.Module):
         y = torch.log(s) - torch.log(1 - s)
         if logpx is None:
             return y
-        return y, logpx - self._logdetgrad(x).view(x.size(0), -1).sum(1, keepdim=True)
+        logpx = logpx - self._logdetgrad(x).view(x.size(0), -1).sum(1, keepdim=True)
+        return y, logpx
 
     def inverse(self, y, logpy=None):
         x = (torch.sigmoid(y) - self.alpha) / (1 - 2 * self.alpha)

@@ -20,8 +20,8 @@ class ResidualFlow(nn.Module):
     def __init__(
         self,
         input_size,
-        n_blocks=[16, 16],
-        intermediate_dim=64,
+        n_blocks=[6, 4],
+        intermediate_dim=128,
         factor_out=True,
         quadratic=False,
         init_layer=None,
@@ -41,7 +41,7 @@ class ResidualFlow(nn.Module):
         kernels='3-1-3',
         activation_fn='elu',
         fc_end=True,
-        fc_idim=128,
+        fc_idim=[256, 128],
         n_exact_terms=0,
         preact=False,
         neumann_grad=True,
@@ -54,7 +54,7 @@ class ResidualFlow(nn.Module):
         block_type='resblock',
     ):
         super(ResidualFlow, self).__init__()
-        self.n_scale = min(len(n_blocks), self._calc_n_scale(input_size))
+        self.n_scale = len(n_blocks)
         self.n_blocks = n_blocks
         self.intermediate_dim = intermediate_dim
         self.factor_out = factor_out
@@ -86,7 +86,10 @@ class ResidualFlow(nn.Module):
         self.classification = classification
         self.classification_hdim = classification_hdim
         self.n_classes = n_classes
+        self.x_code = 0
         self.block_type = block_type
+        self.encoder = encoder32(self.intermediate_dim, 128)
+        self.relu = nn.ReLU()
 
         if not self.n_scale > 0:
             raise ValueError('Could not compute number of scales for input of' 'size (%d,%d,%d,%d)' % input_size)
@@ -99,44 +102,40 @@ class ResidualFlow(nn.Module):
             self.build_multiscale_classifier(input_size)
 
     def _build_net(self, input_size):
-        _, c, h, w = input_size
         transforms = []
-        _stacked_blocks = StackediResBlocks if self.block_type == 'resblock' else StackedCouplingBlocks
-        for i in range(self.n_scale):
-            transforms.append(
-                _stacked_blocks(
-                    initial_size=(c, h, w),
-                    idim=self.intermediate_dim,
-                    squeeze=(i < self.n_scale - 1),  # don't squeeze last layer
-                    init_layer=self.init_layer if i == 0 else None,
-                    n_blocks=self.n_blocks[i],
-                    quadratic=self.quadratic,
-                    actnorm=self.actnorm,
-                    fc_actnorm=self.fc_actnorm,
-                    batchnorm=self.batchnorm,
-                    dropout=self.dropout,
-                    fc=self.fc,
-                    coeff=self.coeff,
-                    vnorms=self.vnorms,
-                    n_lipschitz_iters=self.n_lipschitz_iters,
-                    sn_atol=self.sn_atol,
-                    sn_rtol=self.sn_rtol,
-                    n_power_series=self.n_power_series,
-                    n_dist=self.n_dist,
-                    n_samples=self.n_samples,
-                    kernels=self.kernels,
-                    activation_fn=self.activation_fn,
-                    fc_end=self.fc_end,
-                    fc_idim=self.fc_idim,
-                    n_exact_terms=self.n_exact_terms,
-                    preact=self.preact,
-                    neumann_grad=self.neumann_grad,
-                    grad_in_forward=self.grad_in_forward,
-                    first_resblock=self.first_resblock and (i == 0),
-                    learn_p=self.learn_p,
-                )
+        transforms.append(
+            StackediResBlocks(
+                initial_size=input_size[1:],
+                idim=self.intermediate_dim,
+                squeeze=False,  # don't squeeze last layer
+                init_layer=self.init_layer,
+                n_blocks=self.n_blocks,
+                quadratic=self.quadratic,
+                actnorm=self.actnorm,
+                fc_actnorm=self.fc_actnorm,
+                batchnorm=self.batchnorm,
+                dropout=self.dropout,
+                fc=self.fc,
+                coeff=self.coeff,
+                vnorms=self.vnorms,
+                n_lipschitz_iters=self.n_lipschitz_iters,
+                sn_atol=self.sn_atol,
+                sn_rtol=self.sn_rtol,
+                n_power_series=self.n_power_series,
+                n_dist=self.n_dist,
+                n_samples=self.n_samples,
+                kernels=self.kernels,
+                activation_fn=self.activation_fn,
+                fc_end=self.fc_end,
+                fc_idim=self.fc_idim,
+                n_exact_terms=self.n_exact_terms,
+                preact=self.preact,
+                neumann_grad=self.neumann_grad,
+                grad_in_forward=self.grad_in_forward,
+                first_resblock=False,
+                learn_p=self.learn_p,
             )
-            c, h, w = c * 2 if self.factor_out else c * 4, h // 2, w // 2
+        )
         return nn.ModuleList(transforms)
 
     def _calc_n_scale(self, input_size):
@@ -165,33 +164,28 @@ class ResidualFlow(nn.Module):
         return tuple(output_sizes)
 
     def build_multiscale_classifier(self, input_size):
-        n, c, h, w = input_size
-        hidden_shapes = []
-        for i in range(self.n_scale):
-            if i < self.n_scale - 1:
-                c *= 2 if self.factor_out else 4
-                h //= 2
-                w //= 2
-            hidden_shapes.append((n, c, h, w))
 
         classification_heads = []
-        for i, hshape in enumerate(hidden_shapes):
-            classification_heads.append(
-                nn.Sequential(
-                    nn.Conv2d(hshape[1], self.classification_hdim, 3, 1, 1),
-                    layers.ActNorm2d(self.classification_hdim),
-                    nn.ReLU(inplace=True),
-                    nn.AdaptiveAvgPool2d((1, 1)),
-                )
+        classification_heads.append(
+            nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(512, 100),
+                nn.Linear(100, self.n_classes),
             )
+        )
+
         self.classification_heads = nn.ModuleList(classification_heads)
-        self.logit_layer = nn.Linear(self.classification_hdim * len(classification_heads), self.n_classes)
 
     def forward(self, x, logpx=None, inverse=False, classify=False):
+        x = self.encoder(x)
+
+        self.x_code = x
+        x = self.relu(x)
+
         if inverse:
             return self.inverse(x, logpx)
         out = []
-        if classify: class_outs = []
+        class_outs = []
         for idx in range(len(self.transforms)):
             if logpx is not None:
                 x, logpx = self.transforms[idx].forward(x, logpx)
@@ -203,18 +197,15 @@ class ResidualFlow(nn.Module):
                 out.append(f)
 
             # Handle classification.
-            if classify:
-                if self.factor_out:
-                    class_outs.append(self.classification_heads[idx](f))
-                else:
-                    class_outs.append(self.classification_heads[idx](x))
+
+        class_outs.append(self.classification_heads[idx](self.x_code))
+
 
         out.append(x)
         out = torch.cat([o.view(o.size()[0], -1) for o in out], 1)
         output = out if logpx is None else (out, logpx)
         if classify:
-            h = torch.cat(class_outs, dim=1).squeeze(-1).squeeze(-1)
-            logits = self.logit_layer(h)
+            logits = torch.cat(class_outs, dim=1).squeeze(-1).squeeze(-1)
             return output, logits
         else:
             return output
@@ -260,7 +251,7 @@ class StackediResBlocks(layers.SequentialFlow):
         idim,
         squeeze=True,
         init_layer=None,
-        n_blocks=1,
+        n_blocks=[6, 4],
         quadratic=False,
         actnorm=False,
         fc_actnorm=False,
@@ -278,8 +269,7 @@ class StackediResBlocks(layers.SequentialFlow):
         kernels='3-1-3',
         activation_fn='elu',
         fc_end=True,
-        fc_nblocks=4,
-        fc_idim=128,
+        fc_idim=[256, 128],
         n_exact_terms=0,
         preact=False,
         neumann_grad=True,
@@ -390,30 +380,15 @@ class StackediResBlocks(layers.SequentialFlow):
                     grad_in_forward=grad_in_forward,
                 )
 
-        if init_layer is not None: chain.append(init_layer)
-        if first_resblock and actnorm: chain.append(_actnorm(initial_size, fc))
-        if first_resblock and fc_actnorm: chain.append(_actnorm(initial_size, True))
-
-        if squeeze:
-            c, h, w = initial_size
-            for i in range(n_blocks):
-                if quadratic: chain.append(_quadratic_layer(initial_size, fc))
-                chain.append(_resblock(initial_size, fc, first_resblock=first_resblock and (i == 0)))
-                if actnorm: chain.append(_actnorm(initial_size, fc))
-                if fc_actnorm: chain.append(_actnorm(initial_size, True))
-            chain.append(layers.SqueezeLayer(2))
-        else:
-            for _ in range(n_blocks):
-                if quadratic: chain.append(_quadratic_layer(initial_size, fc))
-                chain.append(_resblock(initial_size, fc))
-                if actnorm: chain.append(_actnorm(initial_size, fc))
-                if fc_actnorm: chain.append(_actnorm(initial_size, True))
-            # Use four fully connected layers at the end.
-            if fc_end:
-                for _ in range(fc_nblocks):
-                    chain.append(_resblock(initial_size, True, fc_idim))
-                    if actnorm or fc_actnorm: chain.append(_actnorm(initial_size, True))
-
+        #if init_layer is not None: chain.append(init_layer)
+        chain.append(init_layer)
+        chain.append(_actnorm(initial_size, True))
+        for _ in range(n_blocks[0]):
+            chain.append(_resblock(initial_size, True, fc_idim[0]))
+            if actnorm or fc_actnorm: chain.append(_actnorm(initial_size, True))
+        for _ in range(n_blocks[1]):
+            chain.append(_resblock(initial_size, True, fc_idim[1]))
+            if actnorm or fc_actnorm: chain.append(_actnorm(initial_size, True))
         super(StackediResBlocks, self).__init__(chain)
 
 
@@ -484,146 +459,101 @@ class FCWrapper(nn.Module):
             return x.view(*shape), logpx
 
 
-class StackedCouplingBlocks(layers.SequentialFlow):
+class encoder32(nn.Module):
+    def __init__(self, image_channels, out_channels):
+        super(self.__class__, self).__init__()
 
-    def __init__(
-        self,
-        initial_size,
-        idim,
-        squeeze=True,
-        init_layer=None,
-        n_blocks=1,
-        quadratic=False,
-        actnorm=False,
-        fc_actnorm=False,
-        batchnorm=False,
-        dropout=0,
-        fc=False,
-        coeff=0.9,
-        vnorms='122f',
-        n_lipschitz_iters=None,
-        sn_atol=None,
-        sn_rtol=None,
-        n_power_series=5,
-        n_dist='geometric',
-        n_samples=1,
-        kernels='3-1-3',
-        activation_fn='elu',
-        fc_end=True,
-        fc_nblocks=4,
-        fc_idim=128,
-        n_exact_terms=0,
-        preact=False,
-        neumann_grad=True,
-        grad_in_forward=False,
-        first_resblock=False,
-        learn_p=False,
-    ):
+        self.conv1 = nn.Conv2d(image_channels, 64, 3, 1, 1, bias=False)
+        self.conv2 = nn.Conv2d(64, 64, 3, 1, 1, bias=False)
+        self.conv3 = nn.Conv2d(64, 128, 3, 2, 1, bias=False)
 
-        # yapf: disable
-        class nonloc_scope: pass
-        nonloc_scope.swap = True
-        # yapf: enable
+        self.conv4 = nn.Conv2d(128, 128, 3, 1, 1, bias=False)
+        self.conv5 = nn.Conv2d(128, 128, 3, 1, 1, bias=False)
+        self.conv6 = nn.Conv2d(128, 128, 3, 2, 1, bias=False)
 
-        chain = []
+        self.conv7 = nn.Conv2d(128, 128, 3, 1, 1, bias=False)
+        self.conv8 = nn.Conv2d(128, 128, 3, 1, 1, bias=False)
+        self.conv9 = nn.Conv2d(128, 128, 3, 2, 1, bias=False)
 
-        def _actnorm(size, fc):
-            if fc:
-                return FCWrapper(layers.ActNorm1d(size[0] * size[1] * size[2]))
-            else:
-                return layers.ActNorm2d(size[0])
+        self.conv10 = nn.Conv2d(out_channels, out_channels, 3, 2, 1, bias=False)
+        self.conv_out_10 = nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False)
 
-        def _quadratic_layer(initial_size, fc):
-            if fc:
-                c, h, w = initial_size
-                dim = c * h * w
-                return FCWrapper(layers.InvertibleLinear(dim))
-            else:
-                return layers.InvertibleConv2d(initial_size[0])
 
-        def _weight_layer(fc):
-            return nn.Linear if fc else nn.Conv2d
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.bn3 = nn.BatchNorm2d(128)
 
-        def _resblock(initial_size, fc, idim=idim, first_resblock=False):
-            if fc:
-                nonloc_scope.swap = not nonloc_scope.swap
-                return layers.CouplingBlock(
-                    initial_size[0],
-                    FCNet(
-                        input_shape=initial_size,
-                        idim=idim,
-                        lipschitz_layer=_weight_layer(True),
-                        nhidden=len(kernels.split('-')) - 1,
-                        activation_fn=activation_fn,
-                        preact=preact,
-                        dropout=dropout,
-                        coeff=None,
-                        domains=None,
-                        codomains=None,
-                        n_iterations=None,
-                        sn_atol=None,
-                        sn_rtol=None,
-                        learn_p=None,
-                        div_in=2,
-                    ),
-                    swap=nonloc_scope.swap,
-                )
-            else:
-                ks = list(map(int, kernels.split('-')))
+        self.bn4 = nn.BatchNorm2d(128)
+        self.bn5 = nn.BatchNorm2d(128)
+        self.bn6 = nn.BatchNorm2d(128)
 
-                if init_layer is None:
-                    _block = layers.ChannelCouplingBlock
-                    _mask_type = 'channel'
-                    div_in = 2
-                    mult_out = 1
-                else:
-                    _block = layers.MaskedCouplingBlock
-                    _mask_type = 'checkerboard'
-                    div_in = 1
-                    mult_out = 2
+        self.bn7 = nn.BatchNorm2d(128)
+        self.bn8 = nn.BatchNorm2d(128)
+        self.bn9 = nn.BatchNorm2d(128)
+        self.bn10 = nn.BatchNorm2d(128)
 
-                nonloc_scope.swap = not nonloc_scope.swap
-                _mask_type += '1' if nonloc_scope.swap else '0'
+        self.dr1 = nn.Dropout2d(0.2)
+        self.dr2 = nn.Dropout2d(0.2)
+        self.dr3 = nn.Dropout2d(0.2)
+        self.dr4 = nn.Dropout2d(0.2)
 
-                nnet = []
-                if not first_resblock and preact:
-                    if batchnorm: nnet.append(layers.MovingBatchNorm2d(initial_size[0]))
-                    nnet.append(ACT_FNS[activation_fn](False))
-                nnet.append(_weight_layer(fc)(initial_size[0] // div_in, idim, ks[0], 1, ks[0] // 2))
-                if batchnorm: nnet.append(layers.MovingBatchNorm2d(idim))
-                nnet.append(ACT_FNS[activation_fn](True))
-                for i, k in enumerate(ks[1:-1]):
-                    nnet.append(_weight_layer(fc)(idim, idim, k, 1, k // 2))
-                    if batchnorm: nnet.append(layers.MovingBatchNorm2d(idim))
-                    nnet.append(ACT_FNS[activation_fn](True))
-                if dropout: nnet.append(nn.Dropout2d(dropout, inplace=True))
-                nnet.append(_weight_layer(fc)(idim, initial_size[0] * mult_out, ks[-1], 1, ks[-1] // 2))
-                if batchnorm: nnet.append(layers.MovingBatchNorm2d(initial_size[0]))
+    def forward(self, x):
+        x = self.dr1(x)
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = nn.LeakyReLU(0.2)(x)
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = nn.LeakyReLU(0.2)(x)
+        x = self.conv3(x)
+        x = self.bn3(x)
+        x = nn.LeakyReLU(0.2)(x)
 
-                return _block(initial_size[0], nn.Sequential(*nnet), mask_type=_mask_type)
+        x = self.dr2(x)
+        x = self.conv4(x)
+        x = self.bn4(x)
+        x = nn.LeakyReLU(0.2)(x)
+        x = self.conv5(x)
+        x = self.bn5(x)
+        x = nn.LeakyReLU(0.2)(x)
+        x = self.conv6(x)
+        x = self.bn6(x)
+        x = nn.LeakyReLU(0.2)(x)
 
-        if init_layer is not None: chain.append(init_layer)
-        if first_resblock and actnorm: chain.append(_actnorm(initial_size, fc))
-        if first_resblock and fc_actnorm: chain.append(_actnorm(initial_size, True))
+        x = self.dr3(x)
+        x = self.conv7(x)
+        x = self.bn7(x)
+        x = nn.LeakyReLU(0.2)(x)
+        x = self.conv8(x)
+        x = self.bn8(x)
+        x = nn.LeakyReLU(0.2)(x)
+        x = self.conv9(x)
+        x = self.bn9(x)
+        x = nn.LeakyReLU(0.2)(x)
 
-        if squeeze:
-            c, h, w = initial_size
-            for i in range(n_blocks):
-                if quadratic: chain.append(_quadratic_layer(initial_size, fc))
-                chain.append(_resblock(initial_size, fc, first_resblock=first_resblock and (i == 0)))
-                if actnorm: chain.append(_actnorm(initial_size, fc))
-                if fc_actnorm: chain.append(_actnorm(initial_size, True))
-            chain.append(layers.SqueezeLayer(2))
-        else:
-            for _ in range(n_blocks):
-                if quadratic: chain.append(_quadratic_layer(initial_size, fc))
-                chain.append(_resblock(initial_size, fc))
-                if actnorm: chain.append(_actnorm(initial_size, fc))
-                if fc_actnorm: chain.append(_actnorm(initial_size, True))
-            # Use four fully connected layers at the end.
-            if fc_end:
-                for _ in range(fc_nblocks):
-                    chain.append(_resblock(initial_size, True, fc_idim))
-                    if actnorm or fc_actnorm: chain.append(_actnorm(initial_size, True))
+        x = self.dr4(x)
+        x = self.conv10(x)
+        x = self.bn10(x)
+        x = nn.LeakyReLU(0.2)(x)
+        x = self.conv_out_10(x)
 
-        super(StackedCouplingBlocks, self).__init__(chain)
+        return self.clamp_to_unit_sphere(x)
+
+    def clamp_to_unit_sphere(self, x, components=4):
+        # If components=4, then we normalize each quarter of x independently
+        # Useful for the latent spaces of fully-convolutional networks
+        batch_size, latent_size, h, w = x.shape
+        x = x.view(batch_size, -1)
+        latent_size = latent_size * components
+        latent_subspaces = []
+        for i in range(components):
+            step = latent_size // components
+            left, right = step * i, step * (i + 1)
+            subspace = x[:, left:right].clone()
+            norm = torch.norm(subspace, p=2, dim=1)
+            subspace = subspace / norm.expand(1, -1).t()  # + epsilon
+            latent_subspaces.append(subspace)
+        # Join the normalized pieces back together
+        output = torch.cat(latent_subspaces, dim=1)
+        output = output.view(batch_size, -1, h, w)
+        return output

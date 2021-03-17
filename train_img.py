@@ -6,12 +6,11 @@ import os.path
 import numpy as np
 from tqdm import tqdm
 import gc
-
+from cifar_dataset import CIFARDataset
 import torch
 import torchvision.transforms as transforms
-from torchvision.utils import save_image
-import torchvision.datasets as vdsets
-
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import roc_curve, auc, roc_auc_score, f1_score
 from lib.resflow import ACT_FNS, ResidualFlow
 import lib.datasets as datasets
 import lib.optimizers as optim
@@ -19,21 +18,18 @@ import lib.utils as utils
 import lib.layers as layers
 import lib.layers.base as base_layers
 from lib.lr_scheduler import CosineAnnealingWarmRestarts
-
+import pickle
 # Arguments
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    '--data', type=str, default='cifar10', choices=[
+    '--data', type=str, default='mnist', choices=[
         'mnist',
         'cifar10',
         'svhn',
-        'celebahq',
-        'celeba_5bit',
-        'imagenet32',
-        'imagenet64',
     ]
 )
-parser.add_argument('--dataroot', type=str, default='data')
+parser.add_argument('--dataroot', type=str, default='./data')
+parser.add_argument('--split', type=str, default='split0')
 parser.add_argument('--imagesize', type=int, default=32)
 parser.add_argument('--nbits', type=int, default=8)  # Only used for celebahq.
 
@@ -43,7 +39,7 @@ parser.add_argument('--coeff', type=float, default=0.98)
 parser.add_argument('--vnorms', type=str, default='2222')
 parser.add_argument('--n-lipschitz-iters', type=int, default=None)
 parser.add_argument('--sn-tol', type=float, default=1e-3)
-parser.add_argument('--learn-p', type=eval, choices=[True, False], default=False)
+parser.add_argument('--learn_p', type=eval, choices=[True, False], default=True)
 
 parser.add_argument('--n-power-series', type=int, default=None)
 parser.add_argument('--factor-out', type=eval, choices=[True, False], default=False)
@@ -55,8 +51,8 @@ parser.add_argument('--neumann-grad', type=eval, choices=[True, False], default=
 parser.add_argument('--mem-eff', type=eval, choices=[True, False], default=True)
 
 parser.add_argument('--act', type=str, choices=ACT_FNS.keys(), default='swish')
-parser.add_argument('--idim', type=int, default=512)
-parser.add_argument('--nblocks', type=str, default='16-16-16')
+parser.add_argument('--idim', type=int, default=128)
+parser.add_argument('--nblocks', type=str, default='6-4')
 parser.add_argument('--squeeze-first', type=eval, default=False, choices=[True, False])
 parser.add_argument('--actnorm', type=eval, default=True, choices=[True, False])
 parser.add_argument('--fc-actnorm', type=eval, default=False, choices=[True, False])
@@ -64,38 +60,34 @@ parser.add_argument('--batchnorm', type=eval, default=False, choices=[True, Fals
 parser.add_argument('--dropout', type=float, default=0.)
 parser.add_argument('--fc', type=eval, default=False, choices=[True, False])
 parser.add_argument('--kernels', type=str, default='3-1-3')
-parser.add_argument('--add-noise', type=eval, choices=[True, False], default=True)
 parser.add_argument('--quadratic', type=eval, choices=[True, False], default=False)
 parser.add_argument('--fc-end', type=eval, choices=[True, False], default=True)
-parser.add_argument('--fc-idim', type=int, default=128)
+parser.add_argument('--fc-idim', type=list, default=[256, 128])
 parser.add_argument('--preact', type=eval, choices=[True, False], default=True)
 parser.add_argument('--padding', type=int, default=0)
 parser.add_argument('--first-resblock', type=eval, choices=[True, False], default=True)
 parser.add_argument('--cdim', type=int, default=256)
 
-parser.add_argument('--optimizer', type=str, choices=['adam', 'adamax', 'rmsprop', 'sgd'], default='adam')
 parser.add_argument('--scheduler', type=eval, choices=[True, False], default=False)
 parser.add_argument('--nepochs', help='Number of epochs for training', type=int, default=1000)
 parser.add_argument('--batchsize', help='Minibatch size', type=int, default=64)
-parser.add_argument('--lr', help='Learning rate', type=float, default=1e-3)
+parser.add_argument('--lr', help='Learning rate', type=float, default=1e-2)
 parser.add_argument('--wd', help='Weight decay', type=float, default=0)
 parser.add_argument('--warmup-iters', type=int, default=1000)
 parser.add_argument('--annealing-iters', type=int, default=0)
-parser.add_argument('--save', help='directory to save results', type=str, default='experiment1')
-parser.add_argument('--val-batchsize', help='minibatch size', type=int, default=200)
+parser.add_argument('--save', help='directory to save results', type=str, default='experiment3')
+parser.add_argument('--val-batchsize', help='minibatch size', type=int, default=64)
 parser.add_argument('--seed', type=int, default=None)
 parser.add_argument('--ema-val', type=eval, choices=[True, False], default=True)
-parser.add_argument('--update-freq', type=int, default=1)
+parser.add_argument('--update_freq', type=int, default=1)
 
-parser.add_argument('--task', type=str, choices=['density', 'classification', 'hybrid'], default='density')
 parser.add_argument('--scale-dim', type=eval, choices=[True, False], default=False)
 parser.add_argument('--rcrop-pad-mode', type=str, choices=['constant', 'reflect'], default='reflect')
 parser.add_argument('--padding-dist', type=str, choices=['uniform', 'gaussian'], default='uniform')
 
-parser.add_argument('--resume', type=str, default=None)
+parser.add_argument('--resume', type=str, default=None, help='./experiment1/models/most_recent.pth')
 parser.add_argument('--begin-epoch', type=int, default=0)
 
-parser.add_argument('--nworkers', type=int, default=4)
 parser.add_argument('--print-freq', help='Print progress every so iterations', type=int, default=20)
 parser.add_argument('--vis-freq', help='Visualize progress every so iterations', type=int, default=500)
 args = parser.parse_args()
@@ -159,17 +151,6 @@ def reduce_bits(x):
     return x
 
 
-def add_noise(x, nvals=256):
-    """
-    [0, 1] -> [0, nvals] -> add noise -> [0, 1]
-    """
-    if args.add_noise:
-        noise = x.new().resize_as_(x).uniform_()
-        x = x * (nvals - 1) + noise
-        x = x / nvals
-    return x
-
-
 def update_lr(optimizer, itr):
     iter_frac = min(float(itr + 1) / max(args.warmup_iters, 1), 1.0)
     lr = args.lr * iter_frac
@@ -201,215 +182,85 @@ def remove_padding(x):
     else:
         return x
 
-
+dataset_folder_path = os.path.join(args.dataroot, args.data, args.split)
+with open(dataset_folder_path + '/train_obj.pkl', 'rb') as f:
+    train_obj = pickle.load(f)
+with open(dataset_folder_path + '/test_obj.pkl', 'rb') as f:
+    test_obj = pickle.load(f)
+with open(dataset_folder_path + '/meta.pkl', 'rb') as f:
+    meta_dict = pickle.load(f)
+with open(dataset_folder_path + '/class_to_idx.pkl', 'rb') as f:
+    class_to_idx = pickle.load(f)
+with open(dataset_folder_path + '/idx_to_class.pkl', 'rb') as f:
+    idx_to_class = pickle.load(f)
+with open(dataset_folder_path + '/open_class_to_idx.pkl', 'rb') as f:
+    open_class_to_idx = pickle.load(f)
+with open(dataset_folder_path + '/open_idx_to_class.pkl', 'rb') as f:
+    open_idx_to_class = pickle.load(f)
+with open(dataset_folder_path + '/open_test_obj.pkl', 'rb') as fo:
+    open_test_obj = pickle.load(fo)
+with open(dataset_folder_path + '/open_meta.pkl', 'rb') as fo:
+    open_meta_dict = pickle.load(fo)
 logger.info('Loading dataset {}'.format(args.data))
+
 # Dataset and hyperparameters
 if args.data == 'cifar10':
     im_dim = 3
-    n_classes = 10
-    if args.task in ['classification', 'hybrid']:
+    n_classes = 6
 
-        # Classification-specific preprocessing.
-        transform_train = transforms.Compose([
-            transforms.Resize(args.imagesize),
-            transforms.RandomCrop(32, padding=4, padding_mode=args.rcrop_pad_mode),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            add_noise,
-        ])
+    # Classification-specific preprocessing.
+    train_trans = transforms.Compose([
+        transforms.RandomCrop(32, padding=4, padding_mode=args.rcrop_pad_mode),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+    ])
 
-        transform_test = transforms.Compose([
-            transforms.Resize(args.imagesize),
-            transforms.ToTensor(),
-            add_noise,
-        ])
+    test_trans = transforms.Compose([
+        transforms.ToTensor(),
+    ])
 
-        # Remove the logit transform.
-        init_layer = layers.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
-    else:
-        transform_train = transforms.Compose([
-            transforms.Resize(args.imagesize),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            add_noise,
-        ])
-        transform_test = transforms.Compose([
-            transforms.Resize(args.imagesize),
-            transforms.ToTensor(),
-            add_noise,
-        ])
-        init_layer = layers.LogitTransform(0.05)
-    train_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10(args.dataroot, train=True, transform=transform_train),
-        batch_size=args.batchsize,
-        shuffle=True,
-        num_workers=args.nworkers,
-    )
-    test_loader = torch.utils.data.DataLoader(
-        datasets.CIFAR10(args.dataroot, train=False, transform=transform_test),
-        batch_size=args.val_batchsize,
-        shuffle=False,
-        num_workers=args.nworkers,
-    )
 elif args.data == 'mnist':
     im_dim = 1
-    init_layer = layers.LogitTransform(1e-6)
-    n_classes = 10
-    train_loader = torch.utils.data.DataLoader(
-        datasets.MNIST(
-            args.dataroot, train=True, transform=transforms.Compose([
-                transforms.Resize(args.imagesize),
+    n_classes = 6
+    train_trans = transforms.Compose([
+                transforms.Resize((32, 32)),
                 transforms.ToTensor(),
-                add_noise,
             ])
-        ),
-        batch_size=args.batchsize,
-        shuffle=True,
-        num_workers=args.nworkers,
-    )
-    test_loader = torch.utils.data.DataLoader(
-        datasets.MNIST(
-            args.dataroot, train=False, transform=transforms.Compose([
-                transforms.Resize(args.imagesize),
-                transforms.ToTensor(),
-                add_noise,
-            ])
-        ),
-        batch_size=args.val_batchsize,
-        shuffle=False,
-        num_workers=args.nworkers,
-    )
+    test_trans = train_trans
+
 elif args.data == 'svhn':
     im_dim = 3
-    init_layer = layers.LogitTransform(0.05)
-    n_classes = 10
-    train_loader = torch.utils.data.DataLoader(
-        vdsets.SVHN(
-            args.dataroot, split='train', download=True, transform=transforms.Compose([
+    n_classes = 6
+    train_trans = transforms.Compose([
                 transforms.Resize(args.imagesize),
                 transforms.RandomCrop(32, padding=4, padding_mode=args.rcrop_pad_mode),
                 transforms.ToTensor(),
-                add_noise,
             ])
-        ),
-        batch_size=args.batchsize,
-        shuffle=True,
-        num_workers=args.nworkers,
-    )
-    test_loader = torch.utils.data.DataLoader(
-        vdsets.SVHN(
-            args.dataroot, split='test', download=True, transform=transforms.Compose([
-                transforms.Resize(args.imagesize),
+    test_trans = transforms.Compose([
                 transforms.ToTensor(),
-                add_noise,
             ])
-        ),
-        batch_size=args.val_batchsize,
-        shuffle=False,
-        num_workers=args.nworkers,
-    )
-elif args.data == 'celebahq':
-    im_dim = 3
-    init_layer = layers.LogitTransform(0.05)
-    if args.imagesize != 256:
-        logger.info('Changing image size to 256.')
-        args.imagesize = 256
-    train_loader = torch.utils.data.DataLoader(
-        datasets.CelebAHQ(
-            train=True, transform=transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                reduce_bits,
-                lambda x: add_noise(x, nvals=2**args.nbits),
-            ])
-        ), batch_size=args.batchsize, shuffle=True, num_workers=args.nworkers
-    )
-    test_loader = torch.utils.data.DataLoader(
-        datasets.CelebAHQ(
-            train=False, transform=transforms.Compose([
-                reduce_bits,
-                lambda x: add_noise(x, nvals=2**args.nbits),
-            ])
-        ), batch_size=args.val_batchsize, shuffle=False, num_workers=args.nworkers
-    )
-elif args.data == 'celeba_5bit':
-    im_dim = 3
-    init_layer = layers.LogitTransform(0.05)
-    if args.imagesize != 64:
-        logger.info('Changing image size to 64.')
-        args.imagesize = 64
-    train_loader = torch.utils.data.DataLoader(
-        datasets.CelebA5bit(
-            train=True, transform=transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                lambda x: add_noise(x, nvals=32),
-            ])
-        ), batch_size=args.batchsize, shuffle=True, num_workers=args.nworkers
-    )
-    test_loader = torch.utils.data.DataLoader(
-        datasets.CelebA5bit(train=False, transform=transforms.Compose([
-            lambda x: add_noise(x, nvals=32),
-        ])), batch_size=args.val_batchsize, shuffle=False, num_workers=args.nworkers
-    )
-elif args.data == 'imagenet32':
-    im_dim = 3
-    init_layer = layers.LogitTransform(0.05)
-    if args.imagesize != 32:
-        logger.info('Changing image size to 32.')
-        args.imagesize = 32
-    train_loader = torch.utils.data.DataLoader(
-        datasets.Imagenet32(train=True, transform=transforms.Compose([
-            add_noise,
-        ])), batch_size=args.batchsize, shuffle=True, num_workers=args.nworkers
-    )
-    test_loader = torch.utils.data.DataLoader(
-        datasets.Imagenet32(train=False, transform=transforms.Compose([
-            add_noise,
-        ])), batch_size=args.val_batchsize, shuffle=False, num_workers=args.nworkers
-    )
-elif args.data == 'imagenet64':
-    im_dim = 3
-    init_layer = layers.LogitTransform(0.05)
-    if args.imagesize != 64:
-        logger.info('Changing image size to 64.')
-        args.imagesize = 64
-    train_loader = torch.utils.data.DataLoader(
-        datasets.Imagenet64(train=True, transform=transforms.Compose([
-            add_noise,
-        ])), batch_size=args.batchsize, shuffle=True, num_workers=args.nworkers
-    )
-    test_loader = torch.utils.data.DataLoader(
-        datasets.Imagenet64(train=False, transform=transforms.Compose([
-            add_noise,
-        ])), batch_size=args.val_batchsize, shuffle=False, num_workers=args.nworkers
-    )
+train_dataset = CIFARDataset(train_obj, meta_dict, class_to_idx, train_trans)
+test_dataset = CIFARDataset(test_obj, meta_dict, class_to_idx, test_trans)
+open_test_dataset = CIFARDataset(open_test_obj, open_meta_dict, open_class_to_idx, test_trans)
+train_loader = DataLoader(train_dataset, batch_size=args.batchsize, shuffle=True, num_workers=4)
+test_loader = DataLoader(test_dataset, batch_size=args.val_batchsize, shuffle=True, num_workers=4)
+open_test_loader = DataLoader(open_test_dataset, batch_size=args.val_batchsize, shuffle=False, num_workers=4)
 
-if args.task in ['classification', 'hybrid']:
-    try:
-        n_classes
-    except NameError:
-        raise ValueError('Cannot perform classification with {}'.format(args.data))
-else:
-    n_classes = 1
 
 logger.info('Dataset loaded.')
 logger.info('Creating model.')
 
 input_size = (args.batchsize, im_dim + args.padding, args.imagesize, args.imagesize)
+
 dataset_size = len(train_loader.dataset)
 
-if args.squeeze_first:
-    input_size = (input_size[0], input_size[1] * 4, input_size[2] // 2, input_size[3] // 2)
-    squeeze_layer = layers.SqueezeLayer(2)
+init_layer = layers.LogitTransform(0.05)
 
 # Model
 model = ResidualFlow(
-    input_size,
+    [args.batchsize, 128, 2, 2],
     n_blocks=list(map(int, args.nblocks.split('-'))),
-    intermediate_dim=args.idim,
+    intermediate_dim=im_dim,
     factor_out=args.factor_out,
     quadratic=args.quadratic,
     init_layer=init_layer,
@@ -436,7 +287,7 @@ model = ResidualFlow(
     grad_in_forward=args.mem_eff,
     first_resblock=args.first_resblock,
     learn_p=args.learn_p,
-    classification=args.task in ['classification', 'hybrid'],
+    classification='hybrid',
     classification_hdim=args.cdim,
     n_classes=n_classes,
     block_type=args.block,
@@ -444,10 +295,6 @@ model = ResidualFlow(
 
 model.to(device)
 ema = utils.ExponentialMovingAverage(model)
-
-
-def parallelize(model):
-    return torch.nn.DataParallel(model)
 
 
 logger.info(model)
@@ -461,24 +308,16 @@ def tensor_in(t, a):
             return True
     return False
 
-
 scheduler = None
 
-if args.optimizer == 'adam':
-    optimizer = optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.99), weight_decay=args.wd)
-    if args.scheduler: scheduler = CosineAnnealingWarmRestarts(optimizer, 20, T_mult=2, last_epoch=args.begin_epoch - 1)
-elif args.optimizer == 'adamax':
-    optimizer = optim.Adamax(model.parameters(), lr=args.lr, betas=(0.9, 0.99), weight_decay=args.wd)
-elif args.optimizer == 'rmsprop':
-    optimizer = optim.RMSprop(model.parameters(), lr=args.lr, weight_decay=args.wd)
-elif args.optimizer == 'sgd':
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.wd)
-    if args.scheduler:
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer, milestones=[60, 120, 160], gamma=0.2, last_epoch=args.begin_epoch - 1
-        )
-else:
-    raise ValueError('Unknown optimizer {}'.format(args.optimizer))
+from itertools import chain
+
+params = [model.encoder.parameters(), model.transforms.parameters()]
+optimizer = optim.Adam(chain(*params), lr=1e-4, betas=(0.9, 0.99), weight_decay=args.wd)
+params_classifer = [model.classification_heads.parameters()]
+optimizer_classifier = torch.optim.SGD(chain(*params_classifer), lr=1e-1, momentum=0.9, weight_decay=args.wd)
+if args.scheduler:
+    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[60, 120, 160], gamma=0.2, last_epoch=args.begin_epoch - 1)
 
 best_test_bpd = math.inf
 if (args.resume is not None):
@@ -511,43 +350,28 @@ criterion = torch.nn.CrossEntropyLoss()
 
 
 def compute_loss(x, model, beta=1.0):
-    bits_per_dim, logits_tensor = torch.zeros(1).to(x), torch.zeros(n_classes).to(x)
+
     logpz, delta_logp = torch.zeros(1).to(x), torch.zeros(1).to(x)
 
-    if args.data == 'celeba_5bit':
-        nvals = 32
-    elif args.data == 'celebahq':
-        nvals = 2**args.nbits
-    else:
-        nvals = 256
+    nvals = 256
 
     x, logpu = add_padding(x, nvals)
 
-    if args.squeeze_first:
-        x = squeeze_layer(x)
+    (z, delta_logp), logits_tensor = model(x, 0, classify=True)
 
-    if args.task == 'hybrid':
-        z_logp, logits_tensor = model(x.view(-1, *input_size[1:]), 0, classify=True)
-        z, delta_logp = z_logp
-    elif args.task == 'density':
-        z, delta_logp = model(x.view(-1, *input_size[1:]), 0)
-    elif args.task == 'classification':
-        z, logits_tensor = model(x.view(-1, *input_size[1:]), classify=True)
+    # log p(z)
+    logpz = standard_normal_logprob(z).view(z.size(0), -1).sum(1, keepdim=True)
 
-    if args.task in ['density', 'hybrid']:
-        # log p(z)
-        logpz = standard_normal_logprob(z).view(z.size(0), -1).sum(1, keepdim=True)
+    # log p(x)
+    logpx = logpz - beta * delta_logp - np.log(nvals) * (
+        2 * 2 * (128 + args.padding)
+    ) - logpu
+    bits_per_dim = -torch.mean(logpx) / (2 * 2 * 128) / np.log(2)
 
-        # log p(x)
-        logpx = logpz - beta * delta_logp - np.log(nvals) * (
-            args.imagesize * args.imagesize * (im_dim + args.padding)
-        ) - logpu
-        bits_per_dim = -torch.mean(logpx) / (args.imagesize * args.imagesize * im_dim) / np.log(2)
+    logpz = torch.mean(logpz).detach()
+    delta_logp = torch.mean(-delta_logp).detach()
 
-        logpz = torch.mean(logpz).detach()
-        delta_logp = torch.mean(-delta_logp).detach()
-
-    return bits_per_dim, logits_tensor, logpz, delta_logp
+    return bits_per_dim, logits_tensor, logpz, delta_logp, logpx
 
 
 def estimator_moments(model, baseline=0):
@@ -585,8 +409,6 @@ ce_meter = utils.RunningAverageMeter(0.97)
 
 
 def train(epoch, model):
-
-    model = parallelize(model)
     model.train()
 
     total = 0
@@ -598,45 +420,27 @@ def train(epoch, model):
 
         global_itr = epoch * len(train_loader) + i
         update_lr(optimizer, global_itr)
-
-        # Training procedure:
-        # for each sample x:
-        #   compute z = f(x)
-        #   maximize log p(x) = log p(z) - log |det df/dx|
-
         x = x.to(device)
 
-        beta = beta = min(1, global_itr / args.annealing_iters) if args.annealing_iters > 0 else 1.
-        bpd, logits, logpz, neg_delta_logp = compute_loss(x, model, beta=beta)
+        beta = min(1, global_itr / args.annealing_iters) if args.annealing_iters > 0 else 1.
+        bpd, logits, logpz, neg_delta_logp, _ = compute_loss(x, model, beta=beta)
 
-        if args.task in ['density', 'hybrid']:
-            firmom, secmom = estimator_moments(model)
+        firmom, secmom = estimator_moments(model)
 
-            bpd_meter.update(bpd.item())
-            logpz_meter.update(logpz.item())
-            deltalogp_meter.update(neg_delta_logp.item())
-            firmom_meter.update(firmom)
-            secmom_meter.update(secmom)
+        bpd_meter.update(bpd.item())
+        logpz_meter.update(logpz.item())
+        deltalogp_meter.update(neg_delta_logp.item())
+        firmom_meter.update(firmom)
+        secmom_meter.update(secmom)
 
-        if args.task in ['classification', 'hybrid']:
-            y = y.to(device)
-            crossent = criterion(logits, y)
-            ce_meter.update(crossent.item())
+        y = y.to(device)
+        crossent = criterion(logits, y)
+        ce_meter.update(crossent.item())
 
-            # Compute accuracy.
-            _, predicted = logits.max(1)
-            total += y.size(0)
-            correct += predicted.eq(y).sum().item()
-
-        # compute gradient and do SGD step
-        if args.task == 'density':
-            loss = bpd
-        elif args.task == 'classification':
-            loss = crossent
-        else:
-            if not args.scale_dim: bpd = bpd * (args.imagesize * args.imagesize * im_dim)
-            loss = bpd + crossent / np.log(2)  # Change cross entropy from nats to bits.
-        loss.backward()
+        # Compute accuracy.
+        _, predicted = logits.max(1)
+        total += y.size(0)
+        correct += predicted.eq(y).sum().item()
 
         if global_itr % args.update_freq == args.update_freq - 1:
 
@@ -648,10 +452,21 @@ def train(epoch, model):
 
             grad_norm = torch.nn.utils.clip_grad.clip_grad_norm_(model.parameters(), 1.)
             if args.learn_p: compute_p_grads(model)
-
-            optimizer.step()
-            optimizer.zero_grad()
-            update_lipschitz(model)
+            if i % 2 == 0:
+                for para in model.encoder.parameters():
+                     para.requires_grad = True
+                loss = bpd
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+                update_lipschitz(model)
+            else:
+                for para in model.encoder.parameters():
+                    para.requires_grad = False
+                loss = crossent
+                loss.backward()
+                optimizer_classifier.step()
+                optimizer_classifier.zero_grad()
             ema.apply()
 
             gnorm_meter.update(grad_norm)
@@ -668,28 +483,22 @@ def train(epoch, model):
                 )
             )
 
-            if args.task in ['density', 'hybrid']:
-                s += (
-                    ' | Bits/dim {bpd_meter.val:.4f}({bpd_meter.avg:.4f}) | '
-                    'Logpz {logpz_meter.avg:.0f} | '
-                    '-DeltaLogp {deltalogp_meter.avg:.0f} | '
-                    'EstMoment ({firmom_meter.avg:.0f},{secmom_meter.avg:.0f})'.format(
-                        bpd_meter=bpd_meter, logpz_meter=logpz_meter, deltalogp_meter=deltalogp_meter,
-                        firmom_meter=firmom_meter, secmom_meter=secmom_meter
-                    )
+            s += (
+                ' | Bits/dim {bpd_meter.val:.4f}({bpd_meter.avg:.4f}) | '
+                'Logpz {logpz_meter.avg:.0f} | '
+                '-DeltaLogp {deltalogp_meter.avg:.0f} | '
+                'EstMoment ({firmom_meter.avg:.0f},{secmom_meter.avg:.0f})'.format(
+                    bpd_meter=bpd_meter, logpz_meter=logpz_meter, deltalogp_meter=deltalogp_meter,
+                    firmom_meter=firmom_meter, secmom_meter=secmom_meter
                 )
+            )
 
-            if args.task in ['classification', 'hybrid']:
-                s += ' | CE {ce_meter.avg:.4f} | Acc {0:.4f}'.format(100 * correct / total, ce_meter=ce_meter)
+            s += ' | CE {ce_meter.avg:.4f} | Acc {0:.4f}'.format(100 * correct / total, ce_meter=ce_meter)
 
             logger.info(s)
-        if i % args.vis_freq == 0:
-            visualize(epoch, model, i, x)
-
         del x
         torch.cuda.empty_cache()
         gc.collect()
-
 
 def validate(epoch, model, ema=None):
     """
@@ -703,7 +512,6 @@ def validate(epoch, model, ema=None):
 
     update_lipschitz(model)
 
-    model = parallelize(model)
     model.eval()
 
     correct = 0
@@ -713,61 +521,58 @@ def validate(epoch, model, ema=None):
     with torch.no_grad():
         for i, (x, y) in enumerate(tqdm(test_loader)):
             x = x.to(device)
-            bpd, logits, _, _ = compute_loss(x, model)
+            bpd, logits, _, _, logpx = compute_loss(x, model)
             bpd_meter.update(bpd.item(), x.size(0))
 
-            if args.task in ['classification', 'hybrid']:
-                y = y.to(device)
-                loss = criterion(logits, y)
-                ce_meter.update(loss.item(), x.size(0))
-                _, predicted = logits.max(1)
-                total += y.size(0)
-                correct += predicted.eq(y).sum().item()
+            y = y.to(device)
+            loss = criterion(logits, y)
+            ce_meter.update(loss.item(), x.size(0))
+            _, predicted = logits.max(1)
+            total += y.size(0)
+            correct += predicted.eq(y).sum().item()
+
     val_time = time.time() - start
 
     if ema is not None:
         ema.swap()
     s = 'Epoch: [{0}]\tTime {1:.2f} | Test bits/dim {bpd_meter.avg:.4f}'.format(epoch, val_time, bpd_meter=bpd_meter)
-    if args.task in ['classification', 'hybrid']:
-        s += ' | CE {:.4f} | Acc {:.2f}'.format(ce_meter.avg, 100 * correct / total)
+
+    s += ' | CE {:.4f} | Acc {:.2f}'.format(ce_meter.avg, 100 * correct / total)
     logger.info(s)
     return bpd_meter.avg
 
-
-def visualize(epoch, model, itr, real_imgs):
+def open_test(model):
+    """
+    Evaluates the cross entropy between p_data and p_model.
+    """
+    update_lipschitz(model)
     model.eval()
-    utils.makedirs(os.path.join(args.save, 'imgs'))
-    real_imgs = real_imgs[:32]
-    _real_imgs = real_imgs
-
-    if args.data == 'celeba_5bit':
-        nvals = 32
-    elif args.data == 'celebahq':
-        nvals = 2**args.nbits
-    else:
-        nvals = 256
-
+    correct = 0
+    total = 0
+    known_logpx = []
+    unknown_logpx = []
     with torch.no_grad():
-        # reconstructed real images
-        real_imgs, _ = add_padding(real_imgs, nvals)
-        if args.squeeze_first: real_imgs = squeeze_layer(real_imgs)
-        recon_imgs = model(model(real_imgs.view(-1, *input_size[1:])), inverse=True).view(-1, *input_size[1:])
-        if args.squeeze_first: recon_imgs = squeeze_layer.inverse(recon_imgs)
-        recon_imgs = remove_padding(recon_imgs)
+        for i, (x, y) in enumerate(tqdm(test_loader)):
+            x = x.to(device)
+            bpd, logits, _, _, logpx = compute_loss(x, model)
 
-        # random samples
-        fake_imgs = model(fixed_z, inverse=True).view(-1, *input_size[1:])
-        if args.squeeze_first: fake_imgs = squeeze_layer.inverse(fake_imgs)
-        fake_imgs = remove_padding(fake_imgs)
+            y = y.to(device)
+            probs, predicted = logits.max(1)
+            known_logpx.extend(logpx.tolist())
+            total += y.size(0)
+            correct += predicted.eq(y).sum().item()
+        for i, (x, y) in enumerate(tqdm(open_test_loader)):
+            x = x.to(device)
+            bpd, logits, _, _, logpx = compute_loss(x, model)
 
-        fake_imgs = fake_imgs.view(-1, im_dim, args.imagesize, args.imagesize)
-        recon_imgs = recon_imgs.view(-1, im_dim, args.imagesize, args.imagesize)
-        imgs = torch.cat([_real_imgs, fake_imgs, recon_imgs], 0)
-
-        filename = os.path.join(args.save, 'imgs', 'e{:03d}_i{:06d}.png'.format(epoch, itr))
-        save_image(imgs.cpu().float(), filename, nrow=16, padding=2)
-    model.train()
-
+            y = y.to(device)
+            probs, predicted = logits.max(1)
+            unknown_logpx.extend(logpx.tolist())
+    labels = [1]*len(known_logpx) + [0]*len(unknown_logpx)
+    preds = known_logpx + unknown_logpx
+    auc = roc_auc_score(labels, preds)
+    print('Closed ACC:', correct/total, 'AUC:', auc)
+    return bpd_meter.avg
 
 def get_lipschitz_constants(model):
     lipschitz_constants = []
@@ -779,7 +584,6 @@ def get_lipschitz_constants(model):
         if isinstance(m, base_layers.LopConv2d) or isinstance(m, base_layers.LopLinear):
             lipschitz_constants.append(m.scale)
     return lipschitz_constants
-
 
 def update_lipschitz(model):
     with torch.no_grad():
@@ -803,10 +607,8 @@ def get_ords(model):
             ords.append(codomain)
     return ords
 
-
 def pretty_repr(a):
     return '[[' + ','.join(list(map(lambda i: f'{i:.2f}', a))) + ']]'
-
 
 def main():
     global best_test_bpd
@@ -815,8 +617,9 @@ def main():
     lipschitz_constants = []
     ords = []
 
-    # if args.resume:
-    #     validate(args.begin_epoch - 1, model, ema)
+    if args.resume:
+        validate(args.begin_epoch - 1, model, ema)
+        open_test(model)
     for epoch in range(args.begin_epoch, args.nepochs):
 
         logger.info('Current LR {}'.format(optimizer.param_groups[0]['lr']))
