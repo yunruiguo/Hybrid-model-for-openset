@@ -22,13 +22,13 @@ import pickle
 # Arguments
 parser = argparse.ArgumentParser()
 parser.add_argument(
-    '--data', type=str, default='mnist', choices=[
+    '--data', type=str, default='cifar10', choices=[
         'mnist',
         'cifar10',
         'svhn',
     ]
 )
-parser.add_argument('--dataroot', type=str, default='./data')
+parser.add_argument('--dataroot', type=str, default='../data')
 parser.add_argument('--split', type=str, default='split0')
 parser.add_argument('--imagesize', type=int, default=32)
 parser.add_argument('--nbits', type=int, default=8)  # Only used for celebahq.
@@ -70,12 +70,12 @@ parser.add_argument('--cdim', type=int, default=256)
 
 parser.add_argument('--scheduler', type=eval, choices=[True, False], default=False)
 parser.add_argument('--nepochs', help='Number of epochs for training', type=int, default=1000)
-parser.add_argument('--batchsize', help='Minibatch size', type=int, default=64)
+parser.add_argument('--batchsize', help='Minibatch size', type=int, default=128)
 parser.add_argument('--lr', help='Learning rate', type=float, default=1e-2)
 parser.add_argument('--wd', help='Weight decay', type=float, default=0)
 parser.add_argument('--warmup-iters', type=int, default=1000)
 parser.add_argument('--annealing-iters', type=int, default=0)
-parser.add_argument('--save', help='directory to save results', type=str, default='experiment3')
+parser.add_argument('--save', help='directory to save results', type=str, default='cifar10split0_v2')
 parser.add_argument('--val-batchsize', help='minibatch size', type=int, default=64)
 parser.add_argument('--seed', type=int, default=None)
 parser.add_argument('--ema-val', type=eval, choices=[True, False], default=True)
@@ -85,7 +85,7 @@ parser.add_argument('--scale-dim', type=eval, choices=[True, False], default=Fal
 parser.add_argument('--rcrop-pad-mode', type=str, choices=['constant', 'reflect'], default='reflect')
 parser.add_argument('--padding-dist', type=str, choices=['uniform', 'gaussian'], default='uniform')
 
-parser.add_argument('--resume', type=str, default='./experiment3/models/most_recent.pth')
+parser.add_argument('--resume', type=str, default=None, help='./cifar10split0_v2/models/most_recent.pth')
 parser.add_argument('--begin-epoch', type=int, default=0)
 
 parser.add_argument('--print-freq', help='Print progress every so iterations', type=int, default=20)
@@ -310,12 +310,13 @@ def tensor_in(t, a):
 
 scheduler = None
 
-from itertools import chain
+#from itertools import chain
 
-params = [model.encoder.parameters(), model.transforms.parameters()]
-optimizer = optim.Adam(chain(*params), lr=1e-4, betas=(0.9, 0.99), weight_decay=args.wd)
-params_classifer = [model.classification_heads.parameters()]
-optimizer_classifier = torch.optim.SGD(chain(*params_classifer), lr=1e-1, momentum=0.9, weight_decay=args.wd)
+params = list(model.encoder.parameters()) + list(model.transforms.parameters())
+optimizer = optim.Adam(model.parameters(), lr=1e-3, betas=(0.9, 0.99), weight_decay=args.wd)
+params_classifer = list(model.classification_heads.parameters())
+# optimizer_classifier = torch.optim.SGD(params_classifer, lr=1e-1, momentum=0.9, weight_decay=args.wd)
+optimizer_classifier = torch.optim.Adam(model.parameters(), lr=1e-1, betas=(0.9, 0.99), weight_decay=args.wd)
 if args.scheduler:
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[60, 120, 160], gamma=0.2, last_epoch=args.begin_epoch - 1)
 
@@ -441,29 +442,28 @@ def train(epoch, model):
 
         if global_itr % args.update_freq == args.update_freq - 1:
 
-            if args.update_freq > 1:
-                with torch.no_grad():
-                    for p in model.parameters():
-                        if p.grad is not None:
-                            p.grad /= args.update_freq
 
-            grad_norm = torch.nn.utils.clip_grad.clip_grad_norm_(model.parameters(), 1.)
             if args.learn_p: compute_p_grads(model)
             if i % 2 == 0:
-                for para in model.encoder.parameters():
-                     para.requires_grad = True
+                if args.update_freq > 1:
+                    with torch.no_grad():
+                        for p in model.parameters():
+                            if p.grad is not None:
+                                p.grad = p.grad / args.update_freq
+
+                grad_norm = torch.nn.utils.clip_grad.clip_grad_norm_(model.parameters(), 1.)
+
                 loss = bpd
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
                 update_lipschitz(model)
             else:
-                for para in model.encoder.parameters():
-                    para.requires_grad = False
                 loss = crossent
                 loss.backward()
                 optimizer_classifier.step()
                 optimizer_classifier.zero_grad()
+
             ema.apply()
 
             gnorm_meter.update(grad_norm)
@@ -557,7 +557,7 @@ def open_test(epoch, model, ema=None):
 
             y = y.to(device)
             probs, predicted = logits.max(1)
-            known_logpx.extend(probs.tolist())
+            known_logpx.extend(logpx.tolist())
             total += y.size(0)
             correct += predicted.eq(y).sum().item()
         acc = correct / total
@@ -567,7 +567,7 @@ def open_test(epoch, model, ema=None):
 
             y = y.to(device)
             probs, predicted = logits.max(1)
-            unknown_logpx.extend(probs.tolist())
+            unknown_logpx.extend(logpx.tolist())
     if ema is not None:
         ema.swap()
     labels = [1]*len(known_logpx) + [0]*len(unknown_logpx)
